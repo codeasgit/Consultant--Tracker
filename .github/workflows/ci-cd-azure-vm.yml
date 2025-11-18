@@ -1,0 +1,143 @@
+# CI/CD: build and deploy to Azure VM via SSH
+# Trigger: push on main (adjust branch as needed)
+# Required repository secrets (names used below):
+#   AZURE_VM_HOST      - IP or hostname of your VM
+#   AZURE_VM_USER      - SSH user on VM
+#   AZURE_VM_SSH_KEY   - PRIVATE SSH key (no passphrase) for AZURE_VM_USER
+#   AZURE_VM_SSH_PORT  - optional, default 22
+#   AZURE_VM_DEPLOY_PATH - path on VM where app will be deployed (e.g. /opt/consultant-tracker)
+#   MONGODB_URL        - production MongoDB connection string
+#   REACT_APP_API_URL  - production API URL for frontend (e.g. https://api.example.com/api)
+#
+# If you want to use a different secret name, update the workflow accordingly.
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    env:
+      DEPLOY_PATH: ${{ secrets.AZURE_VM_DEPLOY_PATH }}
+      SSH_USER: ${{ secrets.AZURE_VM_USER }}
+      SSH_HOST: ${{ secrets.AZURE_VM_HOST }}
+      SSH_PORT: ${{ secrets.AZURE_VM_SSH_PORT || '22' }}
+      MONGODB_URL: ${{ secrets.MONGODB_URL }}
+      REACT_APP_API_URL: ${{ secrets.REACT_APP_API_URL }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v4
+        with:
+          python-version: 3.11
+
+      - name: Set up Node 18
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Cache npm
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-node-${{ hashFiles('frontend/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-
+
+      - name: Install backend dependencies
+        working-directory: backend
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Build frontend (production)
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
+
+      - name: Create deploy archive
+        run: |
+          # Create a minimal deploy package: backend, build folder, docker-compose.prod.yml if present, and deploy script
+          mkdir -p deploy_package
+          cp -r backend deploy_package/backend
+          if [ -d frontend/build ]; then
+            cp -r frontend/build deploy_package/frontend_build
+          else
+            echo "Frontend build missing" && exit 1
+          fi
+          if [ -f docker-compose.prod.yml ]; then
+            cp docker-compose.prod.yml deploy_package/
+          fi
+          cp -r deploy deploy_package/deploy || true
+          tar -czf deploy_package.tar.gz -C deploy_package .
+
+      - name: Copy package to Azure VM
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ env.SSH_HOST }}
+          username: ${{ env.SSH_USER }}
+          port: ${{ env.SSH_PORT }}
+          key: ${{ secrets.AZURE_VM_SSH_KEY }}
+          source: "deploy_package.tar.gz"
+          target: "/tmp/deploy_package.tar.gz"
+
+      - name: Deploy on Azure VM (extract, write .env, run docker-compose)
+        uses: appleboy/ssh-action@v0.1.9
+        with:
+          host: ${{ env.SSH_HOST }}
+          username: ${{ env.SSH_USER }}
+          port: ${{ env.SSH_PORT }}
+          key: ${{ secrets.AZURE_VM_SSH_KEY }}
+          script: |
+            set -e
+            DEPLOY_DIR="${DEPLOY_PATH:-/opt/consultant-tracker}"
+            echo "Creating deploy directory $DEPLOY_DIR"
+            sudo mkdir -p "$DEPLOY_DIR"
+            sudo chown $SSH_USER:$SSH_USER "$DEPLOY_DIR"
+            # extract payload
+            tar -xzf /tmp/deploy_package.tar.gz -C /tmp
+            # move contents into place (atomic-ish)
+            rsync -a --delete /tmp/deploy_package/ "$DEPLOY_DIR/"
+            # create .env file for docker-compose (backend + frontend envs)
+            cat > "$DEPLOY_DIR/.env" <<EOF
+MONGODB_URL=${MONGODB_URL}
+CORS_ORIGINS=http://localhost:3000
+REACT_APP_API_URL=${REACT_APP_API_URL}
+EOF
+            # ensure deploy script is executable (if present)
+            if [ -f "$DEPLOY_DIR/deploy/deploy_on_vm.sh" ]; then
+              chmod +x "$DEPLOY_DIR/deploy/deploy_on_vm.sh"
+              (cd "$DEPLOY_DIR" && ./deploy/deploy_on_vm.sh)
+            else
+              # Fallback: try docker-compose directly if available
+              if command -v docker-compose >/dev/null 2>&1 || docker compose version >/dev/null 2>&1 ; then
+                cd "$DEPLOY_DIR"
+                if [ -f docker-compose.prod.yml ]; then
+                  docker-compose -f docker-compose.prod.yml pull || true
+                  docker-compose -f docker-compose.prod.yml up -d --build
+                else
+                  echo "docker-compose.prod.yml not found in $DEPLOY_DIR"
+                  exit 1
+                fi
+              else
+                echo "docker-compose not installed on VM"
+                exit 1
+              fi
+            fi
+            echo "Deployment finished"
